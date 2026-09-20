@@ -1,0 +1,713 @@
+// Cour — canonical data model.
+//
+// Architectural rule (roadmap §2): every catalog entity has OUR canonical id
+// as its primary key. External ids live only in ExternalIdMapping. Every
+// user-generated object references our id. Catalog fields carry provenance
+// and an ingestion sync never overwrites a field whose provenance is OWN.
+//
+// Licence constraints baked in here (see docs/phase-0/mal-license-review.md):
+//  - MAL values are stored verbatim; our corrections are independent OWN
+//    values that supersede for display (MAL agreement §3(a)(xii)).
+//  - No MAL user-generated content is ever stored server-side (§3(c)), so
+//    there is deliberately no MAL-list-import table.
+//  - Provenance must be enumerable on demand for audit and 24h takedown
+//    (§§3(e), 18).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum SourceType {
+  MAL
+  ANILIST
+  KITSU
+  TMDB
+  ANIDB
+  ANNICT
+  OWN
+  MERGED
+}
+
+enum MappedBy {
+  AUTO
+  MANUAL
+}
+
+enum MappingTarget {
+  ANIME
+  SEASON
+  EPISODE
+}
+
+enum AnimeFormat {
+  TV
+  TV_SHORT
+  MOVIE
+  OVA
+  ONA
+  SPECIAL
+  MUSIC
+  UNKNOWN
+}
+
+enum AnimeStatus {
+  NOT_YET_AIRED
+  AIRING
+  FINISHED
+  CANCELLED
+  HIATUS
+  UNKNOWN
+}
+
+enum SeasonName {
+  WINTER
+  SPRING
+  SUMMER
+  FALL
+}
+
+enum SeasonPart {
+  FULL // a complete cour or run
+  SPLIT_PART // one half of a split-cour run
+}
+
+// AniDB's typology — the only rigorous one of the three databases.
+enum EpisodeType {
+  STANDARD
+  RECAP
+  SPECIAL
+  OVA
+  ONA
+  MOVIE
+  OP_ED // AniDB "C" — NCOP/NCED
+  TRAILER // AniDB "T"
+  PARODY // AniDB "P"
+  OTHER // AniDB "O"
+}
+
+enum TitleLanguage {
+  JA
+  JA_ROMAJI
+  EN
+  OTHER
+}
+
+enum TitleType {
+  OFFICIAL
+  SYNONYM
+  SHORT
+  ABBREVIATION
+}
+
+enum RelationType {
+  SEQUEL
+  PREQUEL
+  SIDE_STORY
+  ALTERNATIVE_VERSION
+  SUMMARY
+  SPIN_OFF
+  PARENT
+  CHARACTER_SHARED
+  OTHER
+}
+
+enum ReviewTarget {
+  ANIME
+  SEASON
+  EPISODE
+}
+
+enum BodyFormat {
+  MARKDOWN
+  PLAIN
+}
+
+enum UserRole {
+  USER
+  MODERATOR
+  ADMIN
+}
+
+enum SyncStatus {
+  RUNNING
+  SUCCEEDED
+  FAILED
+  CANCELLED
+}
+
+// ---------------------------------------------------------------------------
+// Catalog
+// ---------------------------------------------------------------------------
+
+/// Soft grouping only — "Monogatari", "Fate". Never load-bearing.
+model Franchise {
+  id        String   @id @default(cuid())
+  slug      String   @unique
+  name      String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  anime Anime[]
+}
+
+/// The continuous work. This is what a user follows (product decision Q1).
+/// One Anime may map to several MAL entries (split-cour) or share one AniDB
+/// entry with another Anime. Both directions are expressible.
+model Anime {
+  id          String      @id @default(cuid())
+  slug        String      @unique
+  format      AnimeFormat @default(UNKNOWN)
+  status      AnimeStatus @default(UNKNOWN)
+  synopsis    String?
+  coverImage  String?
+  bannerImage String?
+  startDate   DateTime?   @db.Timestamptz(3)
+  endDate     DateTime?   @db.Timestamptz(3)
+  sourceMedia String? // manga, light novel, original, game…
+  franchiseId String?
+
+  /// Row-level default provenance for fields with no per-field entry.
+  provenance      SourceType @default(MAL)
+  /// { "<field>": { "source": SourceType, "at": ISO8601 } }
+  /// Written only by applyIngest(). See src/server/catalog/provenance.ts.
+  fieldProvenance Json       @default("{}")
+  lastSyncedAt    DateTime?  @db.Timestamptz(3)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  franchise     Franchise?          @relation(fields: [franchiseId], references: [id], onDelete: SetNull)
+  titles        Title[]
+  seasons       Season[]
+  mappings      ExternalIdMapping[]
+  relationsFrom AnimeRelation[]     @relation("RelationFrom")
+  relationsTo   AnimeRelation[]     @relation("RelationTo")
+  reviews       Review[]
+  seriesRatings SeriesRating[]
+  stats         AnimeRatingStats?
+
+  @@index([franchiseId])
+  @@index([status])
+}
+
+/// One row per title variant so all variants share a single tsvector index
+/// and pg_trgm fuzzy match. See D-005.
+model Title {
+  id        String        @id @default(cuid())
+  animeId   String
+  text      String
+  language  TitleLanguage
+  type      TitleType     @default(OFFICIAL)
+  isPrimary Boolean       @default(false)
+
+  provenance SourceType @default(MAL)
+
+  anime Anime @relation(fields: [animeId], references: [id], onDelete: Cascade)
+
+  @@unique([animeId, text, language])
+  @@index([animeId])
+  @@index([text])
+}
+
+/// One broadcast run: a cour, or one part of a split-cour. This is the level
+/// a MAL entry usually maps onto, and the level series ratings attach to
+/// (product decision Q2).
+model Season {
+  id           String      @id @default(cuid())
+  animeId      String
+  /// 1-based ordinal within the Anime.
+  ordinal      Int
+  title        String?
+  part         SeasonPart  @default(FULL)
+  /// Which half of a split run, when part = SPLIT_PART.
+  partNumber   Int?
+  seasonName   SeasonName?
+  seasonYear   Int?
+  episodeCount Int?
+  status       AnimeStatus @default(UNKNOWN)
+  startDate    DateTime?   @db.Timestamptz(3)
+  endDate      DateTime?   @db.Timestamptz(3)
+
+  /// The broadcast RULE, kept apart from each episode's instant. "Saturdays
+  /// 23:30 JST" is a rule; a pre-empted week is an instance that differs.
+  broadcastWeekdayJst Int? // 0 = Sunday
+  broadcastTimeJst    String? // "23:30"
+
+  studios String[] @default([])
+
+  provenance      SourceType @default(MAL)
+  fieldProvenance Json       @default("{}")
+  lastSyncedAt    DateTime?  @db.Timestamptz(3)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  anime    Anime               @relation(fields: [animeId], references: [id], onDelete: Cascade)
+  episodes Episode[]
+  mappings ExternalIdMapping[]
+  reviews  Review[]
+  ratings  SeasonRating[]
+  stats    SeasonRatingStats?
+
+  @@unique([animeId, ordinal])
+  @@index([seasonYear, seasonName])
+  @@index([status])
+}
+
+/// Every episode belongs to a Season, including films and one-shots, which
+/// get an implicit single Season. See D-002.
+model Episode {
+  id       String @id @default(cuid())
+  seasonId String
+
+  /// Broadcast-run numbering (MAL / AniList shape).
+  numberInSeason Int
+  /// Continuous numbering across the whole Anime (AniDB shape). Nullable
+  /// because it is not always knowable at ingest time.
+  absoluteNumber Int?
+
+  type                 EpisodeType @default(STANDARD)
+  /// Whether Phase 4 progress-gating counts this episode. Deliberately
+  /// separate from `type` so policy changes are data, not migrations.
+  countsTowardProgress Boolean     @default(true)
+
+  titleEn     String?
+  titleJa     String?
+  titleRomaji String?
+  synopsis    String?
+  runtimeMins Int?
+  /// Exact UTC instant this episode aired. Derived from the JST rule on
+  /// Season, but stored per-episode because weeks get pre-empted.
+  airedAt     DateTime? @db.Timestamptz(3)
+  isFiller    Boolean   @default(false)
+  thumbnail   String?
+
+  provenance      SourceType @default(MAL)
+  fieldProvenance Json       @default("{}")
+  lastSyncedAt    DateTime?  @db.Timestamptz(3)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  season   Season              @relation(fields: [seasonId], references: [id], onDelete: Cascade)
+  mappings ExternalIdMapping[]
+  logs     EpisodeLog[]
+  ratings  EpisodeRating[]
+  reviews  Review[]
+  stats    EpisodeRatingStats?
+
+  @@unique([seasonId, type, numberInSeason])
+  @@index([airedAt])
+  @@index([seasonId, numberInSeason])
+}
+
+model AnimeRelation {
+  id          String       @id @default(cuid())
+  fromAnimeId String
+  toAnimeId   String
+  type        RelationType
+  provenance  SourceType   @default(MAL)
+
+  from Anime @relation("RelationFrom", fields: [fromAnimeId], references: [id], onDelete: Cascade)
+  to   Anime @relation("RelationTo", fields: [toAnimeId], references: [id], onDelete: Cascade)
+
+  @@unique([fromAnimeId, toAnimeId, type])
+  @@index([toAnimeId])
+}
+
+// ---------------------------------------------------------------------------
+// External identity — the layer the whole architecture rests on
+// ---------------------------------------------------------------------------
+
+/// Polymorphic by three nullable FKs plus a CHECK that exactly one is set
+/// (prisma/sql/001_constraints.sql). A single targetId column would be
+/// tidier and would throw away referential integrity. See D-007.
+model ExternalIdMapping {
+  id                 String        @id @default(cuid())
+  provider           SourceType
+  /// The provider's own entity type, verbatim ("anime", "episode", …).
+  providerEntityType String
+  providerId         String
+  targetType         MappingTarget
+
+  animeId   String?
+  seasonId  String?
+  episodeId String?
+
+  confidence Float     @default(1.0)
+  mappedBy   MappedBy  @default(AUTO)
+  verifiedAt DateTime? @db.Timestamptz(3)
+  createdAt  DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt  DateTime  @updatedAt @db.Timestamptz(3)
+
+  anime   Anime?   @relation(fields: [animeId], references: [id], onDelete: Cascade)
+  season  Season?  @relation(fields: [seasonId], references: [id], onDelete: Cascade)
+  episode Episode? @relation(fields: [episodeId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerEntityType, providerId])
+  @@index([animeId])
+  @@index([seasonId])
+  @@index([episodeId])
+  @@index([provider, targetType])
+}
+
+/// Raw provider responses, so a modelling fix can be re-applied to the whole
+/// catalog at zero API cost. Catalog payloads only — never user content
+/// (MAL agreement §3(c)). See D-014.
+model ExternalPayload {
+  id                 String     @id @default(cuid())
+  provider           SourceType
+  providerEntityType String
+  providerId         String
+  fetchedAt          DateTime   @default(now()) @db.Timestamptz(3)
+  body               Json
+
+  @@unique([provider, providerEntityType, providerId])
+  @@index([fetchedAt])
+}
+
+/// Makes backfills resumable and idempotent. A backfill that cannot resume
+/// gets run twice by accident, and the second run is where duplicates appear.
+model SyncRun {
+  id         String     @id @default(cuid())
+  provider   SourceType
+  kind       String // "season-backfill", "episode-refresh", …
+  cursor     String?
+  status     SyncStatus @default(RUNNING)
+  startedAt  DateTime   @default(now()) @db.Timestamptz(3)
+  finishedAt DateTime?  @db.Timestamptz(3)
+  stats      Json       @default("{}")
+  error      String?
+
+  @@index([provider, kind, startedAt])
+}
+
+// ---------------------------------------------------------------------------
+// Users
+// ---------------------------------------------------------------------------
+
+model User {
+  id          String   @id @default(cuid())
+  email       String?  @unique
+  handle      String   @unique
+  displayName String?
+  avatarUrl   String?
+  bio         String?
+  /// IANA zone. Load-bearing: the airing schedule renders JST in user-local
+  /// time, and guessing per-request is how these apps break at midnight.
+  timezone    String   @default("UTC")
+  role        UserRole @default(USER)
+
+  /// Load-bearing for Phase 4 rating weight. Never backfill or reset this.
+  createdAt     DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt     DateTime  @updatedAt @db.Timestamptz(3)
+  emailVerified DateTime? @db.Timestamptz(3)
+  deletedAt     DateTime? @db.Timestamptz(3)
+
+  accounts       Account[]
+  sessions       Session[]
+  logs           EpisodeLog[]
+  episodeRatings EpisodeRating[]
+  seasonRatings  SeasonRating[]
+  seriesRatings  SeriesRating[]
+  reviews        Review[]
+  comments       Comment[]
+  following      Follow[]        @relation("Follower")
+  followers      Follow[]        @relation("Following")
+
+  @@index([createdAt])
+}
+
+// Auth.js v5 adapter models. Included now so adding auth is not a migration
+// against a populated user table.
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String?
+  access_token      String?
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String?
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime @db.Timestamptz(3)
+
+  @@unique([identifier, token])
+}
+
+model Follow {
+  followerId  String
+  followingId String
+  createdAt   DateTime @default(now()) @db.Timestamptz(3)
+
+  follower  User @relation("Follower", fields: [followerId], references: [id], onDelete: Cascade)
+  following User @relation("Following", fields: [followingId], references: [id], onDelete: Cascade)
+
+  @@id([followerId, followingId])
+  @@index([followingId])
+}
+
+// ---------------------------------------------------------------------------
+// Logging and ratings
+// ---------------------------------------------------------------------------
+
+/// Multiple rows per (user, episode) are allowed — rewatches are real.
+/// Progress gating asks only whether any row exists.
+model EpisodeLog {
+  id        String   @id @default(cuid())
+  userId    String
+  episodeId String
+  watchedAt DateTime @default(now()) @db.Timestamptz(3)
+  isRewatch Boolean  @default(false)
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  episode Episode @relation(fields: [episodeId], references: [id], onDelete: Cascade)
+
+  @@index([userId, episodeId])
+  @@index([episodeId])
+  @@index([userId, watchedAt])
+}
+
+/// Scores are stored on a 1–100 internal scale regardless of the display
+/// scale. The UI ships 5 stars in half-steps (product decision Q3), which is
+/// the ten values 10, 20 … 100. Storing the display scale is how a site ends
+/// up unable to change granularity without migrating every rating. See D-008.
+///
+/// A rating implies a log (product decision Q4) — enforced in the service
+/// layer, which creates the EpisodeLog in the same transaction.
+model EpisodeRating {
+  id        String @id @default(cuid())
+  userId    String
+  episodeId String
+
+  overall   Int
+  animation Int?
+  story     Int?
+  sound     Int?
+
+  createdAt DateTime  @default(now()) @db.Timestamptz(3)
+  editedAt  DateTime? @db.Timestamptz(3)
+  editCount Int       @default(0)
+
+  /// Phase 4 reputation weighting. Unused until then.
+  weight           Float     @default(1.0)
+  /// Phase 4 burst quarantine: flag, never delete. A quarantined rating
+  /// stays visible and stays in the displayed distribution; it is excluded
+  /// only from the displayed mean. Ships empty. See D-009.
+  quarantinedAt    DateTime? @db.Timestamptz(3)
+  quarantineReason String?
+
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  episode Episode @relation(fields: [episodeId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, episodeId])
+  @@index([episodeId, createdAt])
+  @@index([userId, createdAt])
+}
+
+/// The primary series-level rating (product decision Q2): people have
+/// opinions about "season 4", not "the whole show".
+model SeasonRating {
+  id       String @id @default(cuid())
+  userId   String
+  seasonId String
+
+  overall   Int
+  animation Int?
+  story     Int?
+  sound     Int?
+
+  createdAt DateTime  @default(now()) @db.Timestamptz(3)
+  editedAt  DateTime? @db.Timestamptz(3)
+  editCount Int       @default(0)
+  weight    Float     @default(1.0)
+
+  quarantinedAt    DateTime? @db.Timestamptz(3)
+  quarantineReason String?
+
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  season Season @relation(fields: [seasonId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, seasonId])
+  @@index([seasonId, createdAt])
+}
+
+/// The optional whole-work rating. Secondary to SeasonRating.
+model SeriesRating {
+  id      String @id @default(cuid())
+  userId  String
+  animeId String
+
+  overall   Int
+  animation Int?
+  story     Int?
+  sound     Int?
+
+  createdAt DateTime  @default(now()) @db.Timestamptz(3)
+  editedAt  DateTime? @db.Timestamptz(3)
+  editCount Int       @default(0)
+  weight    Float     @default(1.0)
+
+  quarantinedAt    DateTime? @db.Timestamptz(3)
+  quarantineReason String?
+
+  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  anime Anime @relation(fields: [animeId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, animeId])
+  @@index([animeId, createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// Aggregates — Bayesian shrinkage and distribution display are LAUNCH
+// requirements, so these exist in Phase 0. See D-012.
+// ---------------------------------------------------------------------------
+
+model EpisodeRatingStats {
+  episodeId     String   @id
+  count         Int      @default(0)
+  sum           Int      @default(0)
+  mean          Float?
+  bayesianMean  Float?
+  /// Ten buckets, one per half-star.
+  histogram     Int[]    @default([0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+  weightedCount Float    @default(0)
+  weightedMean  Float?
+  updatedAt     DateTime @default(now()) @updatedAt @db.Timestamptz(3)
+
+  episode Episode @relation(fields: [episodeId], references: [id], onDelete: Cascade)
+
+  @@index([bayesianMean])
+}
+
+model SeasonRatingStats {
+  seasonId      String   @id
+  count         Int      @default(0)
+  sum           Int      @default(0)
+  mean          Float?
+  bayesianMean  Float?
+  histogram     Int[]    @default([0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+  weightedCount Float    @default(0)
+  weightedMean  Float?
+  updatedAt     DateTime @default(now()) @updatedAt @db.Timestamptz(3)
+
+  season Season @relation(fields: [seasonId], references: [id], onDelete: Cascade)
+
+  @@index([bayesianMean])
+}
+
+model AnimeRatingStats {
+  animeId       String   @id
+  count         Int      @default(0)
+  sum           Int      @default(0)
+  mean          Float?
+  bayesianMean  Float?
+  histogram     Int[]    @default([0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+  weightedCount Float    @default(0)
+  weightedMean  Float?
+  updatedAt     DateTime @default(now()) @updatedAt @db.Timestamptz(3)
+
+  anime Anime @relation(fields: [animeId], references: [id], onDelete: Cascade)
+
+  @@index([bayesianMean])
+}
+
+// ---------------------------------------------------------------------------
+// Reviews and discussion
+// ---------------------------------------------------------------------------
+
+/// Same three-nullable-FK pattern as ExternalIdMapping, same reason.
+/// Soft-deleted, because comments hang off reviews (D-010).
+model Review {
+  id         String       @id @default(cuid())
+  userId     String
+  targetType ReviewTarget
+
+  animeId   String?
+  seasonId  String?
+  episodeId String?
+
+  title            String?
+  body             String
+  bodyFormat       BodyFormat @default(MARKDOWN)
+  containsSpoilers Boolean    @default(false)
+
+  publishedAt DateTime  @default(now()) @db.Timestamptz(3)
+  editedAt    DateTime? @db.Timestamptz(3)
+  deletedAt   DateTime? @db.Timestamptz(3)
+
+  commentCount Int @default(0)
+  likeCount    Int @default(0)
+
+  user     User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  anime    Anime?    @relation(fields: [animeId], references: [id], onDelete: Cascade)
+  season   Season?   @relation(fields: [seasonId], references: [id], onDelete: Cascade)
+  episode  Episode?  @relation(fields: [episodeId], references: [id], onDelete: Cascade)
+  comments Comment[]
+
+  @@index([userId, publishedAt])
+  @@index([episodeId, publishedAt])
+  @@index([seasonId, publishedAt])
+  @@index([animeId, publishedAt])
+}
+
+/// Discussion always attaches to a review. The review is the root.
+/// `path` is a materialised path so subtree fetch is a prefix index scan
+/// rather than a recursive CTE per render (D-011). Depth capped at 8.
+model Comment {
+  id       String  @id @default(cuid())
+  reviewId String
+  userId   String
+  parentId String?
+  path     String
+  depth    Int     @default(0)
+
+  body      String
+  createdAt DateTime  @default(now()) @db.Timestamptz(3)
+  editedAt  DateTime? @db.Timestamptz(3)
+  deletedAt DateTime? @db.Timestamptz(3)
+
+  review   Review    @relation(fields: [reviewId], references: [id], onDelete: Cascade)
+  user     User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  parent   Comment?  @relation("CommentChildren", fields: [parentId], references: [id], onDelete: Cascade)
+  children Comment[] @relation("CommentChildren")
+
+  @@index([reviewId, path])
+  @@index([userId, createdAt])
+  @@index([parentId])
+}
