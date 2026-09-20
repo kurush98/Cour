@@ -20,18 +20,26 @@ Episode-level anime logging, reviews and discussion.
 
 ## Setup
 
+**New here? Read [SETUP.md](SETUP.md)** — step by step, no assumed knowledge.
+
+The short version:
+
 ```bash
 npm install
 cp .env.example .env     # fill in DATABASE_URL, DIRECT_DATABASE_URL, MAL_CLIENT_ID
 npm run db:migrate       # Prisma migrations
-psql "$DIRECT_DATABASE_URL" -f prisma/sql/001_constraints.sql
-psql "$DIRECT_DATABASE_URL" -f prisma/sql/002_search.sql
+npm run db:sql           # hand-written constraints and search indexes
+npm run doctor           # verifies all of the above
 npm run backfill         # current season + previous four
 ```
 
-The two SQL files are not optional. They carry the CHECK constraints and the
-search indexes that Prisma cannot express (D-017). Run them after every
-`prisma migrate`; both are idempotent.
+`npm run db:sql` is not optional. It applies the CHECK constraints and search
+indexes that Prisma cannot express (D-017). Run it after every
+`prisma migrate`; every file is idempotent.
+
+`npm run doctor` checks Node, `.env`, the database connection, whether
+migrations ran and whether the SQL was applied, and prints the fix for
+anything that is wrong. Run it first whenever something misbehaves.
 
 ## Checks
 
