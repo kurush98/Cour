@@ -7,9 +7,10 @@
  * run is where duplicate catalog entries come from.
  *
  * Usage:
+ *   npm run backfill:quick           # current season only — about a minute
  *   npm run backfill                 # current season + previous 4
  *   npm run backfill -- --seasons 8  # deeper
- *   npm run backfill -- --dry-run
+ *   npm run backfill -- --dry-run    # fetch without writing
  */
 import { prisma } from "@/lib/prisma";
 import { ingestAnime } from "@/server/catalog/ingest";
@@ -23,8 +24,11 @@ function arg(name: string): string | undefined {
 
 async function main(): Promise<void> {
   const dryRun = process.argv.includes("--dry-run");
-  const depth = Number.parseInt(arg("seasons") ?? "4", 10);
+  const depth = process.argv.includes("--current-only")
+    ? 0
+    : Number.parseInt(arg("seasons") ?? "4", 10);
   const seasons = recentSeasons(new Date(), depth);
+  const started = Date.now();
   const source = new MalCatalogSource();
 
   const run = await prisma.syncRun.create({
@@ -42,8 +46,16 @@ async function main(): Promise<void> {
       stats.fetched += entries.length;
       process.stdout.write(`${label}: ${entries.length} entries\n`);
 
+      let done = 0;
       for (const entry of entries) {
         if (dryRun) continue;
+        done += 1;
+        if (done % 25 === 0) {
+          const elapsed = Math.round((Date.now() - started) / 1000);
+          process.stdout.write(
+            `  ${done}/${entries.length} (${elapsed}s elapsed)\n`,
+          );
+        }
         try {
           const result = await ingestAnime(prisma, entry, "MAL");
           if (result.created) stats.created++;
@@ -88,7 +100,10 @@ async function main(): Promise<void> {
     await prisma.$disconnect();
   }
 
-  process.stdout.write(`\nDone: ${JSON.stringify(stats)}\n`);
+  const elapsed = Math.round((Date.now() - started) / 1000);
+  process.stdout.write(
+    `\nDone in ${elapsed}s: ${JSON.stringify(stats)}\n`,
+  );
 }
 
 void main();

@@ -16,7 +16,8 @@
     "backfill": "tsx --env-file=.env scripts/backfill.ts",
     "setup": "prisma migrate deploy && npm run db:sql && npm run doctor",
     "doctor": "tsx --env-file=.env scripts/doctor.ts",
-    "db:sql": "tsx --env-file=.env scripts/apply-sql.ts"
+    "db:sql": "tsx --env-file=.env scripts/apply-sql.ts",
+    "backfill:quick": "tsx --env-file=.env scripts/backfill.ts --current-only"
   },
   "dependencies": {
     "@prisma/client": "^6.1.0",

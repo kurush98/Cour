@@ -30,6 +30,7 @@ cp .env.example .env     # fill in DATABASE_URL, DIRECT_DATABASE_URL, MAL_CLIENT
 npm run db:migrate       # Prisma migrations
 npm run db:sql           # hand-written constraints and search indexes
 npm run doctor           # verifies all of the above
+npm run backfill:quick   # current season only, about a minute
 npm run backfill         # current season + previous four
 ```
 

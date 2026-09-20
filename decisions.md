@@ -289,3 +289,39 @@ where it arrives tagged `OTHER` while the canonical one is `JA_ROMAJI`. Keying
 de-duplication on (text, language) let both survive, which would have shown
 the same title twice in every search result. First occurrence wins, and the
 title list is built in order of authority.
+
+## D-027 — Ingestion plans its writes before making them
+**Phase 0 · Accepted · 2026-09-20 · supersedes the first cut of `ingest.ts`**
+
+The original ingestion did a lookup and then a write per episode and per
+title. For a five-season backfill that is roughly 20,000 episodes and so
+~40,000 sequential round trips to a hosted Postgres — ten to twenty minutes,
+essentially all of it network latency. The rate limiter was never the
+bottleneck: the whole backfill is about twenty API calls, because MAL returns
+fully populated nodes in its paginated season listing.
+
+Now `planWrites()` (src/server/catalog/plan.ts) is a pure function that takes
+every existing row (one query) and the incoming records, and returns creates,
+updates and no-ops. The caller then issues one `createMany` and updates only
+the rows whose values actually differ.
+
+Consequences worth knowing:
+
+- A re-run over unchanged data performs **no writes at all**, which makes
+  re-running the backfill cheap enough to do casually.
+- Unchanged rows keep a stale `lastSyncedAt`. Deliberate: re-stamping twenty
+  thousand untouched rows every sync costs minutes and tells us nothing. Sync
+  recency lives on the parent `Season` and on `SyncRun`.
+- The planner is pure, so the part of ingestion most worth testing is testable
+  without a database — including that it still refuses to touch `OWN` fields.
+
+Interactive transactions were also given an explicit 30s timeout. Prisma
+defaults to five, which a large season legitimately exceeds on a slow link,
+and a partial ingest is worse than a slow one.
+
+## D-028 — `backfill:quick` seeds only the current season
+**Phase 0 · Accepted · 2026-09-20**
+
+First-run time matters more than completeness. One season is ~300 shows and
+about a minute, and is enough to build and use the whole of Phase 1. The full
+five-season backfill stays one command away.

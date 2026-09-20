@@ -162,19 +162,26 @@ npm run doctor
 
 Every line should say `ok`. If one says `FAIL`, it tells you what to do.
 
-Then load real data:
+Then load real data. Start with the quick one:
+
+```bash
+npm run backfill:quick
+```
+
+This pulls **just the current anime season** — around 300 shows, about a
+minute. That is plenty to start Phase 1 on, and you can go wider whenever.
+
+When you want the full set:
 
 ```bash
 npm run backfill
 ```
 
-This pulls the current anime season and the previous four from MAL. It is
-deliberately slow — one request per second, because MAL publishes no rate
-limit and §4(j) asks us not to burden their servers. Expect **10–20 minutes**.
-It prints each season as it goes. Leave it running.
+Current season plus the previous four, a few minutes. It prints progress as
+it goes. Both commands are safe to re-run: a second run over unchanged data
+writes nothing.
 
-Want to see it work first without waiting? `npm run backfill -- --dry-run`
-fetches without writing anything.
+Want to watch it fetch without writing anything? Add `-- --dry-run`.
 
 ---
 
